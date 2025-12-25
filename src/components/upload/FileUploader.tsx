@@ -26,7 +26,7 @@ export function FileUploader({ className }: FileUploaderProps) {
 
   const handleComplete = useCallback((hash: string, zipContents: string[]) => {
     setCompletionData({
-      filename: session?.filename || 'Unknown',
+      filename: session?.filename || 'Uploaded file',
       hash,
       zipContents,
     });

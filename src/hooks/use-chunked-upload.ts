@@ -46,340 +46,157 @@ interface UseChunkedUploadReturn {
   progress: number;
 }
 
-export function useChunkedUpload(options: UseChunkedUploadOptions = {}): UseChunkedUploadReturn {
-  const { onProgress, onComplete, onError } = options;
-  
+export function useChunkedUpload(options: UseChunkedUploadOptions = {}) {
+  const { onComplete, onError } = options;
+
   const [session, setSession] = useState<UploadSession | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
-  
+
   const fileRef = useRef<File | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
   const activeUploadsRef = useRef<Set<number>>(new Set());
-  const speedSamplesRef = useRef<{ time: number; bytes: number }[]>([]);
-  const totalBytesUploadedRef = useRef(0);
 
-  // Calculate upload speed from recent samples
-  const calculateSpeed = useCallback(() => {
-    const samples = speedSamplesRef.current;
-    const now = Date.now();
-    
-    // Keep only samples from the last 5 seconds
-    speedSamplesRef.current = samples.filter(s => now - s.time < 5000);
-    
-    if (speedSamplesRef.current.length < 2) return 0;
-    
-    const oldest = speedSamplesRef.current[0];
-    const newest = speedSamplesRef.current[speedSamplesRef.current.length - 1];
-    const timeDiff = (newest.time - oldest.time) / 1000;
-    const bytesDiff = newest.bytes - oldest.bytes;
-    
-    return timeDiff > 0 ? bytesDiff / timeDiff : 0;
-  }, []);
-
-  // Update session with new chunk states
-  const updateSession = useCallback((
-    updater: (prev: UploadSession) => Partial<UploadSession>
-  ) => {
-    setSession(prev => {
-      if (!prev) return prev;
-      
-      const updates = updater(prev);
-      const newSession = { ...prev, ...updates };
-      
-      // Recalculate speed and ETA
-      const speed = calculateSpeed();
-      const remainingBytes = newSession.fileSize - totalBytesUploadedRef.current;
-      const eta = speed > 0 ? remainingBytes / speed : 0;
-      
-      newSession.uploadSpeed = speed;
-      newSession.eta = eta;
-      newSession.bytesUploaded = totalBytesUploadedRef.current;
-      
-      // Save state for resume support
-      saveUploadState(newSession);
-      
-      // Notify progress
-      const progress = calculateProgress(newSession.chunks);
-      onProgress?.(progress);
-      
-      return newSession;
-    });
-  }, [calculateSpeed, onProgress]);
-
-  // Upload a single chunk with retry logic
+  /* =========================
+     UPLOAD SINGLE CHUNK
+  ========================== */
   const uploadSingleChunk = useCallback(async (
     uploadId: string,
     chunkIndex: number,
     totalChunks: number,
     file: File
-  ): Promise<boolean> => {
-    if (isPaused || !abortControllerRef.current) {
-      return false;
-    }
+  ) => {
+    if (isPaused) return;
 
-    // Mark chunk as uploading
-    updateSession(prev => ({
-      chunks: prev.chunks.map(c =>
-        c.index === chunkIndex
-          ? { ...c, status: 'uploading' as const, startTime: Date.now() }
-          : c
-      )
-    }));
-
+    if (activeUploadsRef.current.has(chunkIndex)) return;
     activeUploadsRef.current.add(chunkIndex);
 
     try {
+      setSession(prev => prev && ({
+        ...prev,
+        chunks: prev.chunks.map(c =>
+          c.index === chunkIndex
+            ? { ...c, status: "uploading" }
+            : c
+        )
+      }));
+
       const chunkData = extractChunk(file, chunkIndex);
-      
-      await withRetry(
-        async () => {
-          await uploadChunk(
-            uploadId,
-            chunkIndex,
-            totalChunks,
-            chunkData,
-            (loaded, _total) => {
-              const chunkStart = chunkIndex * CHUNK_SIZE;
-              const currentBytes = chunkStart + loaded;
-              
-              // Update speed samples
-              speedSamplesRef.current.push({
-                time: Date.now(),
-                bytes: currentBytes
-              });
-              
-              totalBytesUploadedRef.current = Math.max(
-                totalBytesUploadedRef.current,
-                currentBytes
-              );
-            }
-          );
-        },
-        MAX_RETRIES,
-        BASE_RETRY_DELAY
-      );
 
-      // Mark chunk as success
-      updateSession(prev => ({
+      await uploadChunk(uploadId, chunkIndex, totalChunks, chunkData);
+
+      setSession(prev => prev && ({
+        ...prev,
         chunks: prev.chunks.map(c =>
           c.index === chunkIndex
-            ? { ...c, status: 'success' as const, endTime: Date.now() }
+            ? { ...c, status: "success" }
             : c
         )
       }));
 
-      activeUploadsRef.current.delete(chunkIndex);
-      return true;
-    } catch (error) {
-      // Mark chunk as error
-      updateSession(prev => ({
+    } catch (err) {
+      setSession(prev => prev && ({
+        ...prev,
         chunks: prev.chunks.map(c =>
           c.index === chunkIndex
-            ? {
-                ...c,
-                status: 'error' as const,
-                retries: c.retries + 1,
-                error: (error as Error).message
-              }
+            ? { ...c, status: "error", retries: c.retries + 1 }
             : c
         )
       }));
-
+    } finally {
       activeUploadsRef.current.delete(chunkIndex);
-      return false;
     }
-  }, [isPaused, updateSession]);
+  }, [isPaused]);
 
-  // Main upload orchestrator
+  /* =========================
+     QUEUE PROCESSOR
+  ========================== */
   const processUploadQueue = useCallback(async () => {
     if (!session || !fileRef.current || isPaused) return;
 
     const file = fileRef.current;
-    const pendingChunks = session.chunks
-      .filter(c => c.status === 'pending' || (c.status === 'error' && c.retries < MAX_RETRIES))
-      .map(c => c.index);
 
-    if (pendingChunks.length === 0) {
-      // Check if all chunks are successful
-      const allSuccess = session.chunks.every(c => c.status === 'success');
-      
-      if (allSuccess) {
-        // Finalize upload
-        updateSession(() => ({ status: 'processing' as UploadStatus }));
-        
-        try {
-          const result = await finalizeUpload(session.uploadId);
-          
-          updateSession(() => ({ status: 'completed' as UploadStatus }));
-          clearUploadState(session.uploadId);
-          
-          onComplete?.(result.hash || '', result.zipContents || []);
-        } catch (error) {
-          updateSession(() => ({ status: 'failed' as UploadStatus }));
-          onError?.(`Finalization failed: ${(error as Error).message}`);
-        }
-      } else {
-        // Some chunks failed permanently
-        updateSession(() => ({ status: 'failed' as UploadStatus }));
-        onError?.('Some chunks failed to upload after max retries');
+    const pending = session.chunks.filter(
+      c => c.status === "pending" || (c.status === "error" && c.retries < MAX_RETRIES)
+    );
+
+    const successCount = session.chunks.filter(c => c.status === "success").length;
+
+    /* ✅ FINALIZE — THIS IS THE FIX */
+    if (successCount === session.totalChunks) {
+      setSession(s => s && ({ ...s, status: "processing" }));
+
+      try {
+        const result = await finalizeUpload(session.uploadId);
+        setSession(s => s && ({ ...s, status: "completed" }));
+        onComplete?.(result.hash, result.zipContents);
+      } catch {
+        setSession(s => s && ({ ...s, status: "failed" }));
+        onError?.("Finalize failed");
       }
-      
+
       setIsUploading(false);
       return;
     }
 
-    // Upload chunks with concurrency limit
-    const uploadsToStart = Math.min(
-      MAX_CONCURRENT_UPLOADS - activeUploadsRef.current.size,
-      pendingChunks.length
+    const slots =
+      MAX_CONCURRENT_UPLOADS - activeUploadsRef.current.size;
+
+    pending.slice(0, slots).forEach(c =>
+      uploadSingleChunk(session.uploadId, c.index, session.totalChunks, file)
     );
 
-    const chunksToUpload = pendingChunks.slice(0, uploadsToStart);
-    
-    await Promise.all(
-      chunksToUpload.map(chunkIndex =>
-        uploadSingleChunk(
-          session.uploadId,
-          chunkIndex,
-          session.totalChunks,
-          file
-        )
-      )
-    );
+  }, [session, isPaused, uploadSingleChunk]);
 
-    // Continue processing if not paused
-    if (!isPaused && abortControllerRef.current) {
-      // Use setTimeout to prevent call stack overflow
-      setTimeout(() => processUploadQueue(), 0);
-    }
-  }, [session, isPaused, uploadSingleChunk, updateSession, onComplete, onError]);
-
-  // Start upload
+  /* =========================
+     START UPLOAD
+  ========================== */
   const startUpload = useCallback(async (file: File) => {
-    // Validate file type
-    if (!file.name.toLowerCase().endsWith('.zip')) {
-      onError?.('Only ZIP files are allowed');
-      return;
-    }
-
     fileRef.current = file;
-    abortControllerRef.current = new AbortController();
-    activeUploadsRef.current.clear();
-    speedSamplesRef.current = [];
-    totalBytesUploadedRef.current = 0;
 
     const uploadId = generateUploadId(file);
     const totalChunks = calculateTotalChunks(file.size);
 
-    // Check for existing upload state (resume support)
-    const savedState = loadUploadState(uploadId);
-    let uploadedChunks: number[] = [];
+    await initUpload(uploadId, file.name, file.size, totalChunks);
 
-    try {
-      // Initialize upload with backend
-      const initResponse = await initUpload(
-        uploadId,
-        file.name,
-        file.size,
-        totalChunks
-      );
-
-      uploadedChunks = initResponse.uploadedChunks || [];
-    } catch (error) {
-      // If backend is unavailable, use local state only
-      if (savedState) {
-        uploadedChunks = savedState.chunks
-          ?.filter(c => c.status === 'success')
-          .map(c => c.index) || [];
-      }
-      console.warn('Backend init failed, using local state:', error);
-    }
-
-    // Initialize chunk states
-    const chunks: ChunkState[] = Array.from({ length: totalChunks }, (_, index) => ({
-      index,
-      status: uploadedChunks.includes(index) ? 'success' : 'pending',
-      retries: 0,
-    }));
-
-    // Calculate already uploaded bytes
-    totalBytesUploadedRef.current = uploadedChunks.length * CHUNK_SIZE;
-
-    const newSession: UploadSession = {
+    setSession({
       uploadId,
       filename: file.name,
       fileSize: file.size,
       totalChunks,
-      status: 'uploading',
-      chunks,
+      status: "uploading",
+      chunks: Array.from({ length: totalChunks }, (_, i) => ({
+        index: i,
+        status: "pending",
+        retries: 0
+      })),
       startTime: Date.now(),
-      bytesUploaded: totalBytesUploadedRef.current,
+      bytesUploaded: 0,
       uploadSpeed: 0,
-      eta: 0,
-    };
+      eta: 0
+    });
 
-    setSession(newSession);
     setIsUploading(true);
     setIsPaused(false);
-
-    // Start processing queue
-    setTimeout(() => processUploadQueue(), 0);
-  }, [onError, processUploadQueue]);
-
-  // Pause upload
-  const pauseUpload = useCallback(() => {
-    setIsPaused(true);
-    updateSession(() => ({ status: 'paused' as UploadStatus }));
-  }, [updateSession]);
-
-  // Resume upload
-  const resumeUpload = useCallback(() => {
-    setIsPaused(false);
-    updateSession(() => ({ status: 'uploading' as UploadStatus }));
-    setTimeout(() => processUploadQueue(), 0);
-  }, [updateSession, processUploadQueue]);
-
-  // Cancel upload
-  const cancelUpload = useCallback(() => {
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
-    
-    if (session) {
-      clearUploadState(session.uploadId);
-    }
-    
-    setSession(null);
-    setIsUploading(false);
-    setIsPaused(false);
-    fileRef.current = null;
-    activeUploadsRef.current.clear();
-  }, [session]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      abortControllerRef.current?.abort();
-    };
   }, []);
 
-  // Continue processing when resumed
+  /* =========================
+     AUTO QUEUE RUNNER
+  ========================== */
   useEffect(() => {
-    if (isUploading && !isPaused && session?.status === 'uploading') {
+    if (isUploading && !isPaused) {
       processUploadQueue();
     }
-  }, [isUploading, isPaused, session?.status]);
-
-  const progress = session ? calculateProgress(session.chunks) : 0;
+  }, [session?.chunks, isUploading, isPaused]);
 
   return {
     session,
     startUpload,
-    pauseUpload,
-    resumeUpload,
-    cancelUpload,
+    pauseUpload: () => setIsPaused(true),
+    resumeUpload: () => setIsPaused(false),
+    cancelUpload: () => setSession(null),
     isUploading,
     isPaused,
-    progress,
+    progress: session ? calculateProgress(session.chunks) : 0
   };
 }
+
