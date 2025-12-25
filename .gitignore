@@ -11,6 +11,9 @@ node_modules
 dist
 dist-ssr
 *.local
+# Uploaded files (never commit)
+backend/uploads/
+backend/uploads/**
 
 # Editor directories and files
 .vscode/*
